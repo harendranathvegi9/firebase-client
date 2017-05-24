@@ -1,7 +1,11 @@
 //import * as admin from "firebase-admin";
 
 const fs = require('fs');
-let notificationSent = {};
+const Redshift = require('node-redshift');
+const mysql = require('mysql');
+const querystring = require('querystring');
+const http = require('http');
+const uuid = require('uuid');
 const admin = require("firebase-admin");
 const serviceAccount = require("./serviceAccountKey.json");
 
@@ -10,11 +14,6 @@ admin.initializeApp({
     databaseURL: "https://truthfinder-1ff0a.firebaseio.com"
 });
 
-const Redshift = require('node-redshift');
-const mysql = require('mysql');
-const querystring = require('querystring');
-const http = require('http');
-const uuid = require('uuid');
 
 const eventsServiceClient = {
     host: 'events.cd4uamqthjmb.us-east-1.redshift.amazonaws.com',
@@ -32,8 +31,12 @@ const accountServiceClient = {
 };
 
 let options = { rawConnection: true };
+let notificationSent = {};
 const redshiftClient = new Redshift(eventsServiceClient, options);
 module.exports = redshiftClient;
+
+//create a file if it doesnt exist yet
+fs.writeFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '', { flag: 'wx' }, function (err) { });
 
 //Get the list of customers we sent notifications today (remporarily doing this because events are not real time))
 fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", 'utf8', function(err, data) {
@@ -51,9 +54,10 @@ fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '
         return notificationSent[k]
     }).join(","));
 
-    const customerQuery = "WITH google_play_customers AS( SELECT \"customer:id\" FROM \"customer:register\" c JOIN \"session:web\"    s USING(\"session:id\") WHERE \"domain\" = 'api.truthfinder.com'    AND c.    \"event:created\"    BETWEEN CURRENT_DATE - INTERVAL '1 days'    AND CURRENT_DATE AND s.\"session:created\" >= CURRENT_DATE - INTERVAL '2 days'    AND \"customer:id\"    NOT IN (SELECT \"customer:id\"        FROM \"communication:push:outbound\"        JOIN \"session:worker\"        USING(\"session:id\") WHERE worker_slug = 'firebase_notification')) SELECT DISTINCT \"customer:id\" customer, \"report:search_pointer\" pointer FROM \"usage:report:view\" WHERE \"customer:id\" IN (SELECT \"customer:id\"    FROM google_play_customers WHERE \"customer:id\" NOT IN (" + Object.keys(notificationSent).map(function(k) {
-        return notificationSent[k]
-    }).join(",") + ") ) AND \"report:search_pointer\" IS NOT NULL AND \"report:type\" = 'person' AND \"event:created\" BETWEEN CURRENT_DATE - INTERVAL '1 day' AND CURRENT_DATE LIMIT 10";
+    const customerQuery = "WITH google_play_customers AS( SELECT \"customer:id\" FROM \"customer:register\" c JOIN \"session:web\"    s USING(\"session:id\") WHERE \"domain\" = 'api.truthfinder.com'    AND c.    \"event:created\"    BETWEEN CURRENT_DATE - INTERVAL '1 days'    AND CURRENT_DATE AND s.\"session:created\" >= CURRENT_DATE - INTERVAL '2 days'    AND \"customer:id\"    NOT IN (SELECT \"customer:id\"        FROM \"communication:push:outbound\"        JOIN \"session:worker\"        USING(\"session:id\") WHERE worker_slug = 'firebase_notification')) SELECT DISTINCT \"customer:id\" customer, \"report:search_pointer\" pointer FROM \"usage:report:view\" WHERE \"customer:id\" IN (SELECT \"customer:id\"    FROM google_play_customers WHERE \"customer:id\" NOT IN (0, " + Object.keys(notificationSent).map(function(k) {
+            return notificationSent[k]
+        }).join(",") + ") ) AND \"report:search_pointer\" IS NOT NULL AND \"report:type\" = 'person' AND \"event:created\" BETWEEN CURRENT_DATE - INTERVAL '1 day' AND CURRENT_DATE" +
+        " LIMIT 5000 ";
     console.log(customerQuery);
 
     // THIS IS THE REAL QUERY
@@ -62,7 +66,6 @@ fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '
     //TESTING BRIANS PHONE
     //let queryString = "SELECT DISTINCT \"customer:id\" customer, \"report:search_pointer\" pointer FROM \"usage:report:view\" WHERE  \"report:search_pointer\" IS NOT NULL  AND \"report:type\" = 'person' AND \"customer:id\"  = 45523182";
     //let queryString = "SELECT DISTINCT \"customer:id\" customer, \"report:search_pointer\" pointer FROM \"usage:report:view\" WHERE  \"report:search_pointer\" IS NOT NULL  AND \"report:type\" = 'person' AND \"customer:id\"  = 45046671";
-
 
     redshiftClient.connect(function(err) {
         if (err) throw err;
@@ -76,16 +79,17 @@ fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '
                         console.log('Pointer: ', data.rows[d].pointer);
 
                         /* CALL DS for each poitner and get the comp data */
-
                         let post_data = querystring.stringify({
                             'pointer': data.rows[d].pointer
                         });
 
-                        // An object of options to indicate where to post to
+                        // Data service green node
                         let post_options = {
-                            host: '172.20.20.53',
+                            host: 'green.data-service-api-v4.service.iad.consul',
                             port: '8000',
-                            path: '/report/person/comp?raw-results=true',
+                            //dont need the premium call anymore
+                            // path: '/report/person/comp?raw-results=true',
+                            path: '/search/person/full',
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/x-www-form-urlencoded',
@@ -103,12 +107,18 @@ fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '
                             });
 
                             res.on('end', function() {
-
+                                try {
+                                    let json = JSON.parse(str);
+                                } catch (e) {
+                                    console.log('invalid json');
+                                    return;
+                                }
                                 if (!JSON.parse(str).results) return;
+                                if (!JSON.parse(str).results[0]) return;
 
-                                //console.log(JSON.parse(str).results[0].bankruptcies);
-                                if (JSON.parse(str).results[0].bankruptcies.length) {
-                                    console.log('This customer has a report with bankrupcy ' + data.rows[d].customer);
+                    	        if(JSON.parse(str).results[0].additional_records.bankruptcies !== 0 ||
+                    	        	JSON.parse(str).results[0].additional_records.foreclosures !== 0){
+                                    console.log('This customer has a report with bankrupcy or foreclosure' + data.rows[d].customer);
                                     console.log('Calling account service for the customer data');
 
                                     //ACCOUNT SERVICE CALL
@@ -229,6 +239,23 @@ fs.readFile(new Date().toISOString().slice(0, 10) + "-notifications_sent.txt", '
                                 } else {
                                     console.log('No good premium data found');
                                 }
+                            });
+                        });
+
+                        post_req.on('error', function(err) {
+                            if (err.code === "ECONNRESET") {
+                                console.log("Timeout occurs");
+                            } else {
+                                console.log("error on data service calls");
+                                console.log(err);
+                            }
+                        });
+
+                        //timeout on data service call 25 SECONDS
+                        post_req.on('socket', function(socket) {
+                            socket.setTimeout(25000);
+                            socket.on('timeout', function() {
+                                post_req.abort();
                             });
                         });
 
